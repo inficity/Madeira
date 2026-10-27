@@ -377,6 +377,7 @@ final class MetalBackedView: UIView {
     private var tmHoldDelay: TimeInterval { InputSettings.shared.touchHoldDelay }
     private var tmDoubleTapTime: TimeInterval { InputSettings.shared.touchDoubleTapTime }
     private var tmSlop: CGFloat { CGFloat(InputSettings.shared.touchSlop) }
+    private var tmScrollStep: CGFloat { CGFloat(InputSettings.shared.touchScrollStep) }
     private let F_MDOWN: UInt32 = 0x20, F_MUP: UInt32 = 0x40
 
     private var touchPointerMode: Bool { InputSettings.shared.touchMode }
@@ -403,14 +404,14 @@ final class MetalBackedView: UIView {
         return CGPoint(x: pts.reduce(0) { $0 + $1.x } / n, y: pts.reduce(0) { $0 + $1.y } / n)
     }
 
-    /// Wheel notches for accumulated finger travel at a guest position. Same
-    /// sense as the two-finger scroll: content follows the finger.
-    private func tmPostWheel(_ dy: CGFloat, at p: CGPoint) {
+    /// Wheel notches for accumulated finger travel at a guest position, one per
+    /// `step` pt. Same sense as the two-finger scroll: content follows the finger.
+    private func tmPostWheel(_ dy: CGFloat, at p: CGPoint, step: CGFloat = MetalBackedView.tmNotch) {
         tmScrollAccum += dy
         let (mx, my) = mapPoint(p)
-        while tmScrollAccum <= -Self.tmNotch { tmScrollAccum += Self.tmNotch
+        while tmScrollAccum <= -step { tmScrollAccum += step
             winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(-120))) }
-        while tmScrollAccum >= Self.tmNotch { tmScrollAccum -= Self.tmNotch
+        while tmScrollAccum >= step { tmScrollAccum -= step
             winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(120))) }
     }
 
@@ -449,7 +450,7 @@ final class MetalBackedView: UIView {
         case .scroll:
             let dy = p.y - tmScrollLastY
             tmScrollLastY = p.y
-            tmPostWheel(dy, at: tmGestureDownPoint)
+            tmPostWheel(dy, at: tmGestureDownPoint, step: tmScrollStep)
         case .move:
             tmMoveCursor(to: p)
         case .none:
@@ -1282,6 +1283,8 @@ final class InputSettings: ObservableObject {
     @Published var touchHoldDelay: Double = 0.25 { didSet { save() } }
     @Published var touchDoubleTapTime: Double = 0.35 { didSet { save() } }
     @Published var touchSlop: Double = 10 { didSet { save() } }
+    /// One-finger drag/hold scroll: pt of finger travel per wheel notch (more = slower).
+    @Published var touchScrollStep: Double = 14 { didSet { save() } }
     /// ml649: heavy diagnostics. Default OFF so the shipped default is the fast
     /// path; flip it on only when a run needs to be explainable.
     @Published var diagnostics = false { didSet { madeira_set_diag_enabled(diagnostics ? 1 : 0); save() } }
@@ -1320,6 +1323,7 @@ final class InputSettings: ObservableObject {
             touchHoldDelay = j["touchHoldDelay"] as? Double ?? 0.25
             touchDoubleTapTime = j["touchDoubleTapTime"] as? Double ?? 0.35
             touchSlop = j["touchSlop"] as? Double ?? 10
+            touchScrollStep = j["touchScrollStep"] as? Double ?? 14
             diagnostics = j["diagnostics"] as? Bool ?? false
             sensMouse = j["sensMouse"] as? Double ?? 1.0
             ignoreTouchesWithMouse = j["ignoreTouchesWithMouse"] as? Bool ?? true
@@ -1337,7 +1341,7 @@ final class InputSettings: ObservableObject {
                                 "touchMode": touchMode, "touchTap": touchTap.rawValue,
                                 "touchDrag": touchDrag.rawValue, "touchHold": touchHold.rawValue,
                                 "touchHoldDelay": touchHoldDelay, "touchDoubleTapTime": touchDoubleTapTime,
-                                "touchSlop": touchSlop]
+                                "touchSlop": touchSlop, "touchScrollStep": touchScrollStep]
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)
     }

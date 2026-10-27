@@ -4331,8 +4331,15 @@ struct LibraryPointerSettings: View {
             }
             touchSlider("Tap movement allowance", value: $input.touchSlop, in: 2...40, step: 1,
                         text: "\(Int(input.touchSlop)) pt")
+            if input.touchDrag == .scroll || input.touchHold == .scroll {
+                touchSlider("Drag per scroll step", value: $input.touchScrollStep, in: 4...60, step: 1,
+                            text: "\(Int(input.touchScrollStep)) pt")
+                Text("How far the finger moves for one wheel notch when a drag scrolls. More is slower.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Button("Reset touch timing") {
                 input.touchHoldDelay = 0.25; input.touchDoubleTapTime = 0.35; input.touchSlop = 10
+                input.touchScrollStep = 14
             }.font(.caption)
         }
         LabeledContent("Touch sensitivity") {
