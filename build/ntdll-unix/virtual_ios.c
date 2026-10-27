@@ -16487,6 +16487,39 @@ static int ios_guest_anon_rwx_view_ok( const struct file_view *view )
     return (view->size & 0xffff) != 0;   /* data, not a code chunk: see above */
 }
 
+/* ml1306: anonymous memory a guest allocated WITHOUT execute (read-write, or reserved
+ * and committed later) and made executable afterwards. The host never runs it: FEX
+ * translates the x86 bytes and keeps SMC itself through NtProtectVirtualMemory (arm with
+ * PAGE_EXECUTE_READ -> PROT_READ, disarm with PAGE_EXECUTE_READWRITE -> read/write), as
+ * on Windows, and plain pages honour both directions. Through the pool every store to
+ * such a page is emulated, and the emulator cannot do everything: BepInEx's IL2CPP
+ * loader made 14 bytes of an ordinary heap page PAGE_EXECUTE_READWRITE for a detour, the
+ * whole 16 KB became an RX alias, and ntdll's own LDAXR/STLXR lock update on that page
+ * could not be emulated (excl-store REFUSED, AV in native code). CoreCLR's loader heaps
+ * (reserved no-access, committed RWX) qualify too, so their data stores stop faulting.
+ * Off by default while it is only verified on that game: MADEIRA_GUEST_RW_EXEC_DATA=1. */
+static int ios_guest_rw_exec_data_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        /* Off by default. 1 keeps guest memory made executable after allocation plain
+         * read/write; FEX traps its code pages per 16 KB host page (ml1306-ml1308). */
+        const char *s = getenv( "MADEIRA_GUEST_RW_EXEC_DATA" );
+        cached = s && *s == '1';
+        if (cached) dprintf( 2, "[guest-rwx] ml1306 MADEIRA_GUEST_RW_EXEC_DATA=1: memory made executable "
+                                "after allocation stays plain read/write\n" );
+    }
+    return cached;
+}
+
+static int ios_guest_rw_exec_view_ok( const struct file_view *view )
+{
+    if (!ios_guest_rw_exec_data_enabled() || !is_view_valloc( view )) return 0;
+    if (view->protect & (SEC_IMAGE | VPROT_ARM64EC | VPROT_SYSTEM)) return 0;
+    return !(view->protect & VPROT_EXEC);   /* allocated without execute */
+}
+
 /* ml1279: anonymous RWX memory in a 32-bit guest window, code chunks included.
  *
  * Nothing there is ever executed by the host: FEX decodes the x86 bytes and runs its own
@@ -16606,7 +16639,7 @@ static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
     {
         struct file_view *view = find_view( (const void *)a, 1 );
         if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
-        if (!ios_guest_anon_rwx_view_ok( view )) return 0;
+        if (!ios_guest_anon_rwx_view_ok( view ) && !ios_guest_rw_exec_view_ok( view )) return 0;
         any = 1;
         a = (uintptr_t)view->base + view->size;
     }
@@ -16616,6 +16649,8 @@ static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
 #endif
 }
 
+
+int ios_host_page_all_writable( const void *addr );   /* ml1302, below */
 
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
@@ -16684,6 +16719,25 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                      (unix_prot & PROT_WRITE) ? 'w' : '-' );
         unix_prot &= ~PROT_EXEC;
         if (!unix_prot) unix_prot = PROT_READ;
+        /* ml1308: mprotect_range hands over the UNION of a host page's four guest pages,
+         * so one writable neighbour kept a host page writable after FEX had trapped the
+         * code page in it (PAGE_EXECUTE_READ), and code writes there never faulted. A
+         * host page is writable only when all its guest pages are; FEX claims a store
+         * anywhere in a host page that holds an RWX page (ml1307) and untraps it whole. */
+        if ((unix_prot & PROT_WRITE) && ios_guest_rw_exec_data_enabled())
+        {
+            char *first = ROUND_ADDR( base, host_page_mask ), *end = (char *)base + size, *p;
+            for (p = first; p < end; p += host_page_size)
+                if (!ios_host_page_all_writable( p )) break;
+            if (p < end)
+            {
+                int rc = 0;
+                for (p = first; p < end; p += host_page_size)
+                    rc |= mprotect_exec( p, host_page_size,
+                                         ios_host_page_all_writable( p ) ? unix_prot : unix_prot & ~PROT_WRITE );
+                return rc ? -1 : 0;
+            }
+        }
     }
 
     /* madeira-bcd [x64-image]: see ios_x64_image_is_host_data. Same contract as
@@ -25481,6 +25535,36 @@ int ios_page_expected_prot( const void *addr )
     BYTE vprot = get_page_vprot( addr );
     if (!(vprot & VPROT_COMMITTED)) return -1;
     return get_unix_prot( vprot );
+}
+
+/* ml1302: is every guest page of this host page writable in Wine's vprot?
+ * get_host_page_vprot() is the UNION, which reads a host page holding one
+ * FEX-trapped (R+X) code page and three writable ones as writable. An anon-JIT
+ * page may only be host-writable when none of its guest pages is trapped. */
+/* ml1308: the page belongs to guest memory that MADEIRA_GUEST_RW_EXEC_DATA keeps plain
+ * (ios_guest_anon_rwx_is_host_data), where a host page's write bit follows all four
+ * guest pages. For [wr-strip], which must not heal such a page back to writable. */
+int ios_page_is_guest_host_data( const void *addr )
+{
+    struct file_view *view;
+    if (!ios_guest_rw_exec_data_enabled()) return 0;
+    if (!(view = find_view( addr, 1 ))) return 0;
+    return ios_guest_anon_rwx_view_ok( view ) || ios_guest_rw_exec_view_ok( view );
+}
+
+int ios_host_page_all_writable( const void *addr )
+{
+    const char *page = ROUND_ADDR( addr, host_page_mask );
+    size_t i;
+
+    /* An uncommitted guest page is inaccessible either way; it must not hold its
+     * committed neighbours read-only (CoreCLR commits its heaps 4 KB at a time). */
+    for (i = 0; i < host_page_size / page_size; i++)
+    {
+        BYTE vprot = get_page_vprot( page + i * page_size );
+        if ((vprot & VPROT_COMMITTED) && !(get_unix_prot( vprot ) & PROT_WRITE)) return 0;
+    }
+    return 1;
 }
 
 /***********************************************************************

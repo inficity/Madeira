@@ -329,6 +329,10 @@ static int ios_exc_handler_started = 0;
  * once before the exception server thread starts; MADEIRA_MACH_ALIGN_FAULT=0
  * turns it off. */
 static int ios_mach_align_fault_enabled = 1;
+/* ml1301: a store into an anon-JIT alias page whose Wine vprot has no WRITE is left
+ * to the SMC path instead of the Mach store emulator (see step 4).
+ * MADEIRA_ALIAS_STORE_SMC=0 restores emulating every such store. */
+static int ios_alias_store_smc_enabled = 1;
 static uintptr_t ios_exc_usd = 0;
 volatile int64_t ios_exc_x18_fixes = 0;
 volatile int64_t ios_exc_usd_fixes = 0;
@@ -3299,6 +3303,7 @@ static void *ios_mach_exception_thread( void *arg )
                  * the secondary alias table to find the user_VA → RW alias
                  * mapping. */
                 uintptr_t rw_addr = 0;
+                int smc_declined_here = 0;
                 /* madeira-bcd pool-low: a store into region C (FEX code buffers) is
                  * routed the same way -- its alias is at the pool's distance. in_low
                  * keeps the bounds checks below to C's own extent. */
@@ -3310,6 +3315,30 @@ static void *ios_mach_exception_thread( void *arg )
                 } else {
                     rw_addr = ios_jit_anon_alias_lookup(fault_addr);
                 }
+                /* ml1301: emulating here never tells FEX the page changed (ml635). When
+                 * FEX has translated code from an anon-JIT page it traps the page RX
+                 * through NtProtectVirtualMemory, which leaves the Wine vprot without
+                 * WRITE (ml640 keeps the host mapping as it is). A store there is
+                 * self-modifying code: decline, so it reaches FEX as an access
+                 * violation, HandleRWXAccessViolation drops the stale translation and
+                 * untraps (vprot gets WRITE back), and the retried store is emulated
+                 * here. Emulating it straight away kept CoreCLR 6 running the old
+                 * UMEntryThunk forever (TheUMEntryPrestub, 7M stores in a minute). */
+                if (rw_addr && !in_jit && ios_alias_store_smc_enabled)
+                {
+                    extern int ios_page_expected_prot( const void *addr );
+                    int want = ios_page_expected_prot( (const void *)fault_addr );
+                    if (want >= 0 && !(want & PROT_WRITE))
+                    {
+                        static unsigned long smc_declined;
+                        if (++smc_declined <= 8 || (smc_declined % 4096) == 0)
+                            dprintf(STDERR_FILENO, "[alias-store] ml1301 #%lu addr=0x%llx vprot has no W "
+                                    "(FEX-trapped code page): to the SMC path\n",
+                                    smc_declined, (unsigned long long)fault_addr);
+                        rw_addr = 0;
+                        smc_declined_here = 1;
+                    }
+                }
                 /* ml348 DISCRIMINATOR: a write fault with NO alias is a
                  * different bug from a write fault whose instruction we can't
                  * decode, and the two need opposite fixes. Without this the
@@ -3317,7 +3346,7 @@ static void *ios_mach_exception_thread( void *arg )
                  * (ml347). Report which case it is, plus the page's ACTUAL
                  * protection — "r-x, no alias" names an exec-downgraded page
                  * that never got dual-mapped. Capped. */
-                if (!rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
+                if (!rw_addr && !smc_declined_here && (uintptr_t)fault_pc >= 0x100000000ULL)
                 {
                     static int noalias_n;
                     if (noalias_n < 8)
@@ -3354,6 +3383,39 @@ static void *ios_mach_exception_thread( void *arg )
                 {
                     uint32_t insn; ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &insn );  /* ml982 */
                     int emulated = 0;
+                    /* ml1305: A STORE THAT CROSSES INTO THE NEXT ANON-JIT ALIAS.
+                     *
+                     * Each committed anon-JIT range gets its own pool slot, and two ranges
+                     * that touch in the guest are usually NOT adjacent in the pool. Every
+                     * case below writes its whole width at rw_addr, so the bytes past the
+                     * guest boundary went into whatever follows this slot in the pool and
+                     * the next range never saw them. CoreCLR 6 copies JIT output with
+                     * 16-byte stores: a `call rel32` at 0x719735bffc kept the 0x00 that was
+                     * at 0x719735c000 instead of 0xFF, the call landed exactly 16MB past
+                     * the precode it meant, and the runtime died in NoExec / AV EXEC.
+                     *
+                     * When the 32 bytes from fault_addr are not one contiguous RW run, run
+                     * the case against a scratch copy (same alignment, so the alignment
+                     * checks still mean the same) and write back each changed byte through
+                     * its own alias. Atomics and exclusives are aligned and never cross;
+                     * they keep the real address so they stay atomic. */
+                    unsigned char split_buf[96] __attribute__((aligned(16)));
+                    unsigned char split_old[32];
+                    unsigned char *split_b = NULL;
+                    uintptr_t split_rw = 0;
+                    if (!in_jit && (insn & 0x3f000000) != 0x08000000 && (insn & 0x3f200c00) != 0x38200000 &&
+                        ios_jit_anon_alias_lookup( fault_addr + 31 ) != rw_addr + 31)
+                    {
+                        unsigned i;
+                        split_b = split_buf + 16 + (fault_addr & 15);
+                        for (i = 0; i < 32; i++)
+                        {
+                            uintptr_t a = ios_jit_anon_alias_lookup( fault_addr + i );
+                            split_b[i] = split_old[i] = a ? *(volatile unsigned char *)a : 0;
+                        }
+                        split_rw = rw_addr;
+                        rw_addr = (uintptr_t)split_b;
+                    }
                     /* STP (SIMD&FP, signed offset, 128-bit Q): 10 101 1 1 0 0 0 imm7 Rt2 Rn Rt
                      *   pattern bits 31-22: 10 1011 1000  → top10 = 0x2B8 (= bits 31..22)
                      *   So mask 0xFFC00000 = top10. Match 0x2B8 << 22 = 0xAE000000? Hmm.
@@ -3408,7 +3470,7 @@ static void *ios_mach_exception_thread( void *arg )
                         uintptr_t rw_end = in_jit ? ((in_low && !ios_jit_low_contains( (uintptr_t)fault_addr + 31 ))
                                                      ? 0 : (uintptr_t)(rw + ((fault_addr + 31) - rx)))
                                                   : (uintptr_t)ios_jit_anon_alias_lookup( fault_addr + 31 );
-                        if (!rw_end || rw_end != (uintptr_t)rw_addr + 31)
+                        if (!split_rw && (!rw_end || rw_end != (uintptr_t)rw_addr + 31))
                         {
                             static int stp_span_n;
                             if (stp_span_n < 4)
@@ -4109,12 +4171,65 @@ static void *ios_mach_exception_thread( void *arg )
                      * a host-runtime fault escapes into the guest's VEH.
                      * Deliberately limited to full-width accesses within the
                      * existing pool alias; no new mapping or permission grant. */
-                    if (!emulated && in_jit &&
-                        (insn & 0xbfa07c00u) == 0x88a07c00u)
+                    /* ml1304: LDADD/LDCLR/LDEOR/LDSET{A}{L}{B,H} — the atomic memory
+                     * operations ml626 left out "until they appear". They have: FEX
+                     * lowers LOCK XADD/AND/OR/XOR to them, and CoreCLR 6 bumps counters in
+                     * its executable loader heap with LDADDAL (0xb8f50106), which went
+                     * undecoded and left the count unchanged. Same rules as SWP: aligned
+                     * only, genuinely atomic, the whole access inside one alias.
+                     *   size(2) 111 V=0 00 A R 1 Rs(5) o3=0 opc(3) 00 Rn(5) Rt(5)
+                     *   mask 0x3F208C00, value 0x38200000; opc 0 add, 1 clr, 2 eor, 3 set */
+                    if (!emulated && (insn & 0x3F208C00) == 0x38200000 && ((insn >> 12) & 7) <= 3)
+                    {
+                        int size_lg2 = (insn >> 30) & 0x3;
+                        int opc = (insn >> 12) & 7;
+                        int rs = (insn >> 16) & 0x1f;
+                        int rt = insn & 0x1f;
+                        unsigned width = 1u << size_lg2;
+                        int inside = in_jit || ios_jit_anon_alias_lookup( fault_addr + width - 1 ) == rw_addr + width - 1;
+
+                        if (inside && !(rw_addr & (width - 1)))
+                        {
+                            uint64_t in = (rs == 31) ? 0 : state.__x[rs];
+                            uint64_t old = 0;
+#define IOS_LDOP(T) do { T *p = (T *)rw_addr; T v = (T)in; switch (opc) { \
+                                case 0: old = __atomic_fetch_add( p, v, __ATOMIC_SEQ_CST ); break; \
+                                case 1: old = __atomic_fetch_and( p, (T)~v, __ATOMIC_SEQ_CST ); break; \
+                                case 2: old = __atomic_fetch_xor( p, v, __ATOMIC_SEQ_CST ); break; \
+                                default: old = __atomic_fetch_or( p, v, __ATOMIC_SEQ_CST ); break; } } while (0)
+                            switch (size_lg2)
+                            {
+                            case 0:  IOS_LDOP(uint8_t);  break;
+                            case 1:  IOS_LDOP(uint16_t); break;
+                            case 2:  IOS_LDOP(uint32_t); break;
+                            default: IOS_LDOP(uint64_t); break;
+                            }
+#undef IOS_LDOP
+                            if (rt != 31) state.__x[rt] = old;  /* XZR: the ST<op> aliases */
+                            emulated = 1;
+                            {
+                                static int ldop_n;
+                                if (ldop_n < 8)
+                                    dprintf(STDERR_FILENO,
+                                        "[ldop-emul] ml1304 #%d insn=0x%08x op=%d size=%u addr=0x%llx old=0x%llx\n",
+                                        ++ldop_n, insn, opc, width,
+                                        (unsigned long long)fault_addr, (unsigned long long)old);
+                            }
+                        }
+                    }
+                    /* ml1303: and on an anon-JIT alias, a guest CAS into a page FEX has
+                     * not trapped (a trapped one was sent to the SMC path above). CoreCLR
+                     * 6 installs stub targets with LOCK CMPXCHG; undecoded here it fell
+                     * through, the swap never happened and a later call jumped through
+                     * an unset slot into unmapped memory (BepInEx IL2CPP, AV EXEC at
+                     * the same address every run). */
+                    if (!emulated && (insn & 0xbfa07c00u) == 0x88a07c00u)
                     {
                         unsigned cas_width = (insn & 0x40000000u) ? 8 : 4;
                         /* madeira-bcd pool-low: within region C for a lock word there */
-                        int cas_inside = in_low
+                        int cas_inside = !in_jit
+                            ? ios_jit_anon_alias_lookup( fault_addr + cas_width - 1 ) == rw_addr + cas_width - 1
+                            : in_low
                             ? ios_jit_low_size_global >= cas_width &&
                               fault_addr - ios_jit_low_rx_global <= ios_jit_low_size_global - cas_width
                             : sz >= cas_width && fault_addr - rx <= sz - cas_width;
@@ -4145,6 +4260,32 @@ static void *ios_mach_exception_thread( void *arg )
                                 ++undecoded_n, insn, (unsigned long long)fault_pc,
                                 (unsigned long long)fault_addr, (unsigned long long)rw_addr);
                     }
+                    if (emulated && split_rw)
+                    {
+                        unsigned i, written = 0, lost = 0;
+                        static int split_n;
+                        for (i = 0; i < 32; i++)
+                        {
+                            uintptr_t a;
+                            if (split_b[i] == split_old[i]) continue;
+                            if ((a = ios_jit_anon_alias_lookup( fault_addr + i )))
+                            {
+                                *(volatile unsigned char *)a = split_b[i];
+                                written++;
+                            }
+                            else lost++;
+                        }
+                        if (split_n < 16 || (lost && split_n < 64))
+                        {
+                            ++split_n;
+                            dprintf(STDERR_FILENO, "[alias-split] ml1305 #%d insn=0x%08x addr=0x%llx bytes=%u%s\n",
+                                    split_n, insn, (unsigned long long)fault_addr, written,
+                                    lost ? " -- SOME BYTES HAVE NO ALIAS, DROPPED" : "");
+                        }
+                        rw_addr = split_rw;
+                    }
+                    else if (split_rw)
+                        rw_addr = split_rw;
                     if (emulated)
                     {
                         /* ml635: record that this alias page was written. FEX's cached
@@ -6534,6 +6675,12 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
             if (!ios_mach_align_fault_enabled)
                 ERR("[unaligned-atomic] Mach-path alignment classification DISABLED by "
                     "MADEIRA_MACH_ALIGN_FAULT=0: alignment faults are delivered as c0000005 there\n");
+        }
+        {
+            /* Default on: a store into an anon-JIT page FEX has trapped goes to the SMC
+             * path. MADEIRA_ALIAS_STORE_SMC=0 emulates every such store again (ml1301). */
+            const char *e = getenv( "MADEIRA_ALIAS_STORE_SMC" );
+            ios_alias_store_smc_enabled = !(e && e[0] == '0');
         }
 
         {
@@ -12964,9 +13111,32 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     host_prot = rbi.protection;
 
                 {
-                    static unsigned long wr_seen, wr_healed;
+                    static unsigned long wr_seen, wr_healed, wr_jit_kept;
+                    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t fault_addr );
+                    extern int ios_host_page_all_writable( const void *addr );
                     int stripped = (is_write && (want & PROT_WRITE) &&
                                     host_prot >= 0 && !(host_prot & VM_PROT_WRITE));
+                    /* An anon-JIT host page holding a FEX-trapped code page must stay
+                     * RX: its stores have to fault so FEX's InvalidationTracker drops
+                     * the stale translation (ml640 never re-traps the host page, and
+                     * iOS mostly refuses W on it anyway). `want` is the union of the
+                     * guest pages, so healing
+                     * on it made the whole 16KB RWX, every later store landed silently
+                     * and FEX kept running old code: CoreCLR 6's precode backpatch
+                     * looped in ThePreStub forever (BepInEx IL2CPP, 100% CPU, no
+                     * frame). Heal only when no guest page in it is trapped. */
+                    extern int ios_page_is_guest_host_data( const void *addr );
+                    /* ml1308: the same for a plain guest page whose host page follows all four
+                     * guest pages (MADEIRA_GUEST_RW_EXEC_DATA): FEX untraps it. */
+                    if (stripped && !ios_host_page_all_writable( siginfo->si_addr ) &&
+                        (ios_jit_anon_alias_lookup( (uintptr_t)siginfo->si_addr ) ||
+                         ios_page_is_guest_host_data( siginfo->si_addr )))
+                    {
+                        stripped = 0;
+                        if (++wr_jit_kept <= 8 || (wr_jit_kept % 4096) == 0)
+                            ERR("[wr-strip] #%lu addr=%p holds a trapped guest page: not healing, "
+                                "SMC path takes it rev=ml1300\n", wr_jit_kept, siginfo->si_addr);
+                    }
                     ++wr_seen;
                     if (wr_seen <= 12 || (wr_seen % 4096) == 0)
                         ERR("[wr-strip] #%lu addr=%p pc=%p esr=0x%llx write=%d "
