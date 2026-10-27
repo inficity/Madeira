@@ -4303,11 +4303,50 @@ struct LibraryPointerSettings: View {
         Picker("Pointer mode", selection: mode) {
             Text("Absolute").tag("absolute"); Text("Relative").tag("relative"); Text("Touch").tag("touch")
         }.pickerStyle(.segmented)
-        Text(input.touchMode ? "Tap the screen to position and click. Hold and move to drag. Two fingers: right click or scroll."
+        Text(input.touchMode ? "The finger is the pointer: choose what a tap, a drag and a hold-then-drag do. Two fingers: right click or scroll."
              : (input.relative ? "Drag to send relative mouse movement for mouse-look. Tap to click." : "Drag the pointer like a trackpad. Tap to click."))
             .font(.caption).foregroundStyle(.secondary)
+        // LabeledContent + menu: reads the same in the library's Form and the in-game menu.
+        if input.touchMode {
+            LabeledContent("Tap") {
+                Picker("Tap", selection: $input.touchTap) {
+                    ForEach(TouchTapAction.allCases, id: \.self) { Text($0.label).tag($0) }
+                }.pickerStyle(.menu).labelsHidden()
+            }
+            LabeledContent("Drag") {
+                Picker("Drag", selection: $input.touchDrag) {
+                    ForEach(TouchDragAction.allCases, id: \.self) { Text($0.label).tag($0) }
+                }.pickerStyle(.menu).labelsHidden()
+            }
+            LabeledContent("Hold, then drag") {
+                Picker("Hold, then drag", selection: $input.touchHold) {
+                    ForEach(TouchDragAction.allCases, id: \.self) { Text($0.label).tag($0) }
+                }.pickerStyle(.menu).labelsHidden()
+            }
+            touchSlider("Hold time", value: $input.touchHoldDelay, in: 0.1...1.0, step: 0.05,
+                        text: String(format: "%.2f s", input.touchHoldDelay))
+            if input.touchTap == .moveDoubleTapClick {
+                touchSlider("Double-tap interval", value: $input.touchDoubleTapTime, in: 0.15...0.8, step: 0.05,
+                            text: String(format: "%.2f s", input.touchDoubleTapTime))
+            }
+            touchSlider("Tap movement allowance", value: $input.touchSlop, in: 2...40, step: 1,
+                        text: "\(Int(input.touchSlop)) pt")
+            Button("Reset touch timing") {
+                input.touchHoldDelay = 0.25; input.touchDoubleTapTime = 0.35; input.touchSlop = 10
+            }.font(.caption)
+        }
         LabeledContent("Touch sensitivity") {
             Slider(value: input.relative ? $input.sensRel : $input.sensAbs, in: 0.1...8)
+        }
+    }
+
+    private func touchSlider(_ title: String, value: Binding<Double>, in range: ClosedRange<Double>,
+                             step: Double, text: String) -> some View {
+        LabeledContent(title) {
+            HStack {
+                Slider(value: value, in: range, step: step)
+                Text(text).font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(minWidth: 48, alignment: .trailing)
+            }
         }
     }
 }

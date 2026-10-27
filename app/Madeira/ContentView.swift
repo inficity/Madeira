@@ -344,9 +344,14 @@ final class MetalBackedView: UIView {
 
     // ==================================================================
     // Touch pointer mode (InputSettings.touchMode), in direct and desktop
-    // sessions alike:
-    //   one-finger tap        — left click where the finger is
-    //   hold (0.25 s) or move — left button down at the touch point, drag, lift
+    // sessions alike. What one finger does is configurable (TouchTapAction,
+    // TouchDragAction); the defaults are the original behaviour:
+    //   one-finger tap        — touchTap: left click where the finger is, or
+    //                           move the cursor there and click on a double tap
+    //   move (before 0.25 s)  — touchDrag: left-button drag from the touch
+    //                           point, wheel scroll there, move the cursor, or
+    //                           nothing
+    //   hold (0.25 s), move   — touchHold: the same choices
     //   two / three-finger tap — right / middle click at the fingers' midpoint
     //   two-finger drag       — scroll wheel
     // The drawn cursor jumps to the finger at once; nothing is posted until
@@ -356,13 +361,22 @@ final class MetalBackedView: UIView {
     private var tmGestureDownPoint = CGPoint.zero
     private var tmPeak = 0
     private var tmResolved = false
-    private var tmDragTouch: UITouch?
+    private var tmActiveTouch: UITouch?           // the finger that owns the resolved gesture
+    private var tmActiveAction = TouchDragAction.none
     private var tmSlopBroken = false
     private var tmGeneration = 0
     private var tmTwoFingerLastY: CGFloat = 0
     private var tmScrollAccum: CGFloat = 0
-    private static let tmHoldDelay: TimeInterval = 0.25
-    private static let tmSlop: CGFloat = 10
+    private var tmScrollLastY: CGFloat = 0
+    // Outlive a gesture: a double tap spans two of them.
+    private var tmLastTapTime: TimeInterval = 0
+    private var tmLastTapPoint = CGPoint.zero
+    private static let tmNotch: CGFloat = 14         // pt of finger travel per wheel notch
+    private static let tmDoubleTapDistance: CGFloat = 40
+    // Tunable in the pointer settings (InputSettings.touch*).
+    private var tmHoldDelay: TimeInterval { InputSettings.shared.touchHoldDelay }
+    private var tmDoubleTapTime: TimeInterval { InputSettings.shared.touchDoubleTapTime }
+    private var tmSlop: CGFloat { CGFloat(InputSettings.shared.touchSlop) }
     private let F_MDOWN: UInt32 = 0x20, F_MUP: UInt32 = 0x40
 
     private var touchPointerMode: Bool { InputSettings.shared.touchMode }
@@ -372,11 +386,13 @@ final class MetalBackedView: UIView {
         tmGestureDownPoint = .zero
         tmPeak = 0
         tmResolved = false
-        tmDragTouch = nil
+        tmActiveTouch = nil
+        tmActiveAction = .none
         tmSlopBroken = false
         tmGeneration += 1
         tmTwoFingerLastY = 0
         tmScrollAccum = 0
+        tmScrollLastY = 0
     }
 
     /// Midpoint of every finger's down point this gesture.
@@ -387,12 +403,89 @@ final class MetalBackedView: UIView {
         return CGPoint(x: pts.reduce(0) { $0 + $1.x } / n, y: pts.reduce(0) { $0 + $1.y } / n)
     }
 
-    private func tmCommitDrag(_ t: UITouch) {
+    /// Wheel notches for accumulated finger travel at a guest position. Same
+    /// sense as the two-finger scroll: content follows the finger.
+    private func tmPostWheel(_ dy: CGFloat, at p: CGPoint) {
+        tmScrollAccum += dy
+        let (mx, my) = mapPoint(p)
+        while tmScrollAccum <= -Self.tmNotch { tmScrollAccum += Self.tmNotch
+            winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(-120))) }
+        while tmScrollAccum >= Self.tmNotch { tmScrollAccum -= Self.tmNotch
+            winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(120))) }
+    }
+
+    /// A real cursor move (the program sees it), not just the drawn cursor.
+    private func tmMoveCursor(to p: CGPoint) {
+        let (x, y) = mapPoint(p)
+        winios_pointer(x, y, F_MOVE | F_ABS, 0)
+    }
+
+    /// The single finger's gesture is now a drag-like one (`action`), decided
+    /// either by leaving the slop or by the hold timer. Every action starts at
+    /// the touch-down point; `p` is where the finger is now.
+    private func tmCommit(_ action: TouchDragAction, _ t: UITouch, at p: CGPoint) {
         guard !tmResolved else { return }
         tmResolved = true
-        tmDragTouch = t
-        let (x, y) = mapPoint(tmGestureDownPoint)
-        winios_post_touch_down(x, y)
+        tmActiveTouch = t
+        tmActiveAction = action
+        switch action {
+        case .drag:
+            let (x, y) = mapPoint(tmGestureDownPoint)
+            winios_post_touch_down(x, y)                 // button down at the ORIGINAL point
+        case .scroll:
+            tmMoveCursor(to: tmGestureDownPoint)
+            tmScrollLastY = tmGestureDownPoint.y
+        case .move, .none:
+            break
+        }
+        tmActiveMoved(p)
+    }
+
+    private func tmActiveMoved(_ p: CGPoint) {
+        switch tmActiveAction {
+        case .drag:
+            let (x, y) = mapPoint(p)
+            winios_post_touch_move(x, y)
+        case .scroll:
+            let dy = p.y - tmScrollLastY
+            tmScrollLastY = p.y
+            tmPostWheel(dy, at: tmGestureDownPoint)
+        case .move:
+            tmMoveCursor(to: p)
+        case .none:
+            break
+        }
+    }
+
+    /// The resolved gesture's finger lifted (or was cancelled): release a held button.
+    private func tmActiveEnded(at p: CGPoint) {
+        if tmActiveAction == .drag {
+            let (x, y) = mapPoint(p)
+            winios_post_touch_up(x, y)
+        }
+        tmResetGesture()
+    }
+
+    private func tmTap(at p: CGPoint) {
+        switch InputSettings.shared.touchTap {
+        case .click:
+            let (x, y) = mapPoint(p)
+            winios_post_touch_down(x, y)
+            winios_post_touch_up(x, y)
+        case .moveDoubleTapClick:
+            let now = Date().timeIntervalSinceReferenceDate
+            if now - tmLastTapTime < tmDoubleTapTime,
+               hypot(p.x - tmLastTapPoint.x, p.y - tmLastTapPoint.y) < Self.tmDoubleTapDistance {
+                let (x, y) = mapPoint(tmLastTapPoint)    // click where the first tap put the cursor
+                winios_post_touch_down(x, y)
+                winios_post_touch_up(x, y)
+                tmLastTapTime = 0
+            } else {
+                tmMoveCursor(to: p)
+                tmLastTapTime = now
+                tmLastTapPoint = p
+            }
+        }
     }
 
     /// Right/middle click at a guest position: winios_post_touch_* are
@@ -415,10 +508,13 @@ final class MetalBackedView: UIView {
             winios_cursor_move(x, y)
             tmGeneration += 1
             let gen = tmGeneration
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.tmHoldDelay) { [weak self, weak t] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + tmHoldDelay) { [weak self, weak t] in
                 guard let self, let t, self.tmGeneration == gen, !self.tmResolved,
                       self.tmDownPoints.count == 1 else { return }
-                self.tmCommitDrag(t)
+                let hold = InputSettings.shared.touchHold
+                if hold != .none { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+                // Resolved even for .none: a hold never falls back to the tap or drag action.
+                self.tmCommit(hold, t, at: t.location(in: self))
             }
         } else {
             // A second or third finger: only a multi-finger tap is possible now.
@@ -434,41 +530,25 @@ final class MetalBackedView: UIView {
             let dy = avg.y - tmTwoFingerLastY
             if abs(dy) > 2 { tmSlopBroken = true }
             tmTwoFingerLastY = avg.y
-            tmScrollAccum += dy
-            let (mx, my) = mapPoint(avg)
-            while tmScrollAccum <= -14 { tmScrollAccum += 14
-                winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(-120))) }
-            while tmScrollAccum >= 14 { tmScrollAccum -= 14
-                winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(120))) }
+            tmPostWheel(dy, at: avg)
             return
         }
         for t in touches {
             guard let down = tmDownPoints[ObjectIdentifier(t)] else { continue }
             let p = t.location(in: self)
             if tmResolved {
-                guard t === tmDragTouch else { continue }
-                let (x, y) = mapPoint(p)
-                winios_post_touch_move(x, y)
+                if t === tmActiveTouch { tmActiveMoved(p) }
                 continue
             }
-            guard tmDownPoints.count == 1 else {
-                if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop { tmSlopBroken = true }
-                continue
-            }
-            if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop {
-                tmSlopBroken = true
-                tmCommitDrag(t)                  // button down at the ORIGINAL point
-                let (x, y) = mapPoint(p)
-                winios_post_touch_move(x, y)
-            }
+            guard hypot(p.x - down.x, p.y - down.y) > tmSlop else { continue }
+            tmSlopBroken = true
+            if tmDownPoints.count == 1 { tmCommit(InputSettings.shared.touchDrag, t, at: p) }
         }
     }
 
     private func touchModeEnded(_ touches: Set<UITouch>, _ event: UIEvent?) {
-        if tmResolved, let d = tmDragTouch, touches.contains(d) {
-            let (x, y) = mapPoint(d.location(in: self))
-            winios_post_touch_up(x, y)
-            tmResetGesture()
+        if tmResolved, let a = tmActiveTouch, touches.contains(a) {
+            tmActiveEnded(at: a.location(in: self))
             return
         }
         guard !tmResolved else { return }
@@ -477,10 +557,7 @@ final class MetalBackedView: UIView {
         tmResetGesture()
         guard !brokeSlop else { return }
         switch peak {
-        case 1:
-            let (x, y) = mapPoint(mid)
-            winios_post_touch_down(x, y)
-            winios_post_touch_up(x, y)
+        case 1: tmTap(at: mid)
         case 2: tmAbsoluteClick(down: F_RDOWN, up: F_RUP, at: mid)
         case 3: tmAbsoluteClick(down: F_MDOWN, up: F_MUP, at: mid)
         default: break
@@ -488,10 +565,8 @@ final class MetalBackedView: UIView {
     }
 
     private func touchModeCancelled(_ touches: Set<UITouch>) {
-        if tmResolved, let d = tmDragTouch, touches.contains(d) {
-            let (x, y) = mapPoint(d.location(in: self))
-            winios_post_touch_up(x, y)   // never leave the button held
-            tmResetGesture()
+        if tmResolved, let a = tmActiveTouch, touches.contains(a) {
+            tmActiveEnded(at: a.location(in: self))   // never leave the button held
             return
         }
         if !tmResolved { tmResetGesture() }
@@ -1161,6 +1236,31 @@ extension MetalBackedView: UIKeyInput {
 /// Stored as JSON in Documents/ rather than UserDefaults: that is the container
 /// we already know survives reinstall (verified), and it can be pulled and
 /// edited with the same devicectl command we use for the log.
+/// Touch pointer mode: what a one-finger tap does.
+enum TouchTapAction: String, CaseIterable {
+    case click                  // left click where the finger is
+    case moveDoubleTapClick     // move the cursor there; a second tap clicks
+
+    var label: String { self == .click ? "Click" : "Move, double-tap to click" }
+}
+
+/// Touch pointer mode: what a one-finger move does, right away or after a hold.
+enum TouchDragAction: String, CaseIterable {
+    case drag       // left button down at the touch point, drag, lift
+    case scroll     // cursor to the touch point, vertical travel turns the wheel there
+    case move       // the cursor follows the finger, no button
+    case none
+
+    var label: String {
+        switch self {
+        case .drag: return "Drag"
+        case .scroll: return "Scroll"
+        case .move: return "Move pointer"
+        case .none: return "Nothing"
+        }
+    }
+}
+
 final class InputSettings: ObservableObject {
     static let shared = InputSettings()
 
@@ -1171,6 +1271,17 @@ final class InputSettings: ObservableObject {
     /// the finger is, hold or move to drag. Checked before `relative`; the
     /// library's pointer picker keeps the two mutually exclusive.
     @Published var touchMode = false { didSet { save() } }
+    /// Touch pointer mode's one-finger actions (MetalBackedView.tmTap/tmCommit):
+    /// a tap, a move before the hold delay, and a hold then move.
+    @Published var touchTap = TouchTapAction.click { didSet { save() } }
+    @Published var touchDrag = TouchDragAction.drag { didSet { save() } }
+    @Published var touchHold = TouchDragAction.drag { didSet { save() } }
+    /// Touch pointer mode timing: how long a still finger waits before it is a
+    /// hold, how soon a second tap must follow to count as a double tap, and
+    /// how far (pt) a finger may wander and still be a tap.
+    @Published var touchHoldDelay: Double = 0.25 { didSet { save() } }
+    @Published var touchDoubleTapTime: Double = 0.35 { didSet { save() } }
+    @Published var touchSlop: Double = 10 { didSet { save() } }
     /// ml649: heavy diagnostics. Default OFF so the shipped default is the fast
     /// path; flip it on only when a run needs to be explainable.
     @Published var diagnostics = false { didSet { madeira_set_diag_enabled(diagnostics ? 1 : 0); save() } }
@@ -1203,6 +1314,12 @@ final class InputSettings: ObservableObject {
             sensAbs  = j["sensAbs"]  as? Double ?? 2.0
             sensRel  = j["sensRel"]  as? Double ?? 2.0
             touchMode = j["touchMode"] as? Bool ?? false
+            touchTap = (j["touchTap"] as? String).flatMap(TouchTapAction.init) ?? .click
+            touchDrag = (j["touchDrag"] as? String).flatMap(TouchDragAction.init) ?? .drag
+            touchHold = (j["touchHold"] as? String).flatMap(TouchDragAction.init) ?? .drag
+            touchHoldDelay = j["touchHoldDelay"] as? Double ?? 0.25
+            touchDoubleTapTime = j["touchDoubleTapTime"] as? Double ?? 0.35
+            touchSlop = j["touchSlop"] as? Double ?? 10
             diagnostics = j["diagnostics"] as? Bool ?? false
             sensMouse = j["sensMouse"] as? Double ?? 1.0
             ignoreTouchesWithMouse = j["ignoreTouchesWithMouse"] as? Bool ?? true
@@ -1217,7 +1334,10 @@ final class InputSettings: ObservableObject {
         let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel, "diagnostics": diagnostics,
                                 "sensMouse": sensMouse, "ignoreTouchesWithMouse": ignoreTouchesWithMouse,
                                 "padRightStickMouse": padRightStickMouse,
-                                "touchMode": touchMode]
+                                "touchMode": touchMode, "touchTap": touchTap.rawValue,
+                                "touchDrag": touchDrag.rawValue, "touchHold": touchHold.rawValue,
+                                "touchHoldDelay": touchHoldDelay, "touchDoubleTapTime": touchDoubleTapTime,
+                                "touchSlop": touchSlop]
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
