@@ -85,8 +85,12 @@ actor SteamConnection {
         task.resume()
 
         // Verify the connection completed (WebSocket handshake + ping round-trip)
+        let pong = ResumeOnce()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             task.sendPing { error in
+                // URLSession can call the pong handler a second time when the socket
+                // aborts ("Software caused connection abort"); resuming twice is fatal.
+                guard pong.claim() else { return }
                 if let error {
                     cont.resume(throwing: SteamError.connectionFailed(error.localizedDescription))
                 } else {
@@ -198,5 +202,18 @@ actor SteamConnection {
         }
         disconnect()
         try await connect()
+    }
+}
+
+/// Lets a callback that may fire more than once resume its continuation only the first time.
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
