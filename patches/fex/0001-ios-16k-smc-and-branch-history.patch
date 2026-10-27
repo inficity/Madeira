@@ -1,0 +1,119 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 72bd99eaf..7086a63a0 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1123,6 +1123,20 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+                                       "NOEXEC" : "PARTIAL",
+                                     Block.Entry, GuestRIP, n);
+                 }
++                /* The executed exits that led here, while they are still the last eight
++                 * (by process exit the guest's own fault handling has replaced them).
++                 * Only filled when MADEIRA_FEX_BRANCH_HISTORY records this executable. */
++#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
++                if (n == 1 && FEXCore::Core::IosGuestBranchTraceEnabled) {
++                  const auto& History = Thread->CurrentFrame->IosGuestBranchHistory;
++                  const uint64_t Count = History.Serial < 8 ? History.Serial : 8;
++                  for (uint64_t i = 0; i < Count; i++) {
++                    const auto& Edge = History.Edges[(History.Serial - 1 - i) & 7];
++                    LogMan::Msg::EFmt("[iOS-noexec] edge #{} source={:#x} target={:#x} block={:#x} hint={}", i,
++                                      Edge.Source, Edge.Target, Edge.Block, Edge.Hint);
++                  }
++                }
++#endif
+                 if (n == 1024) {
+                   LogMan::Msg::EFmt("[iOS-noexec] RUNAWAY: {:#x} has failed to decode 1024 times — the guest is not "
+                                     "making progress (wild control transfer); further identical lines suppressed rev=ml486",
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index f79c77047..007e552aa 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -974,8 +974,13 @@ NTSTATUS ProcessInit() {
+   /* Recorder emitted only for this executable, before CTX/JIT creation. */
+   const auto HistoryName = fextl::string {ExecutableName};
+   const char* HistoryOpt = getenv("MADEIRA_FEX_BRANCH_HISTORY");
++  /* Unset: Launcher.exe only. "0": off. "1": every executable. Anything else
++   * names the executable to record (env.MADEIRA_FEX_BRANCH_HISTORY = Game.exe). */
++  const bool HistoryNamed = HistoryOpt && HistoryOpt[0] && strcmp(HistoryOpt, "0") != 0 && strcmp(HistoryOpt, "1") != 0;
+   FEXCore::Core::IosGuestBranchTraceEnabled =
+-    _stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0');
++    HistoryNamed ? _stricmp(HistoryName.c_str(), HistoryOpt) == 0
++                 : (HistoryOpt && strcmp(HistoryOpt, "1") == 0) ||
++                     (_stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0'));
+   LogMan::Msg::IFmt("FEX: branch-history-v1 madeira-bcd enabled={} exe={}",
+                    FEXCore::Core::IosGuestBranchTraceEnabled != 0, ExecutableName);
+ #endif
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 7f0ed3df1..7406c59a8 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -28,6 +28,9 @@ extern "C" int IosSubfloorEnum(int Index, uint64_t* Low, uint64_t* Real, uint64_
+ #endif
+ 
+ namespace FEX::Windows {
++#ifdef FEX_IOS_HOST
++static constexpr uint64_t IosHostPageSize = 0x4000;  // ml1307: the SMC trap granule
++#endif
+ uint64_t InvalidationTracker::OwnedSharedMutex::Self() {
+ #ifdef FEX_IOS_HOST
+   // The host thread pointer: x18 (the TEB) is not reliable on the iOS host.
+@@ -512,9 +515,18 @@ void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size)
+ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress) {
+   const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
+     std::shared_lock Lock(IntervalsLock);
++#ifdef FEX_IOS_HOST
++    // ml1307: a store anywhere in a host page that holds an RWX page is ours: Wine keeps
++    // the whole host page read-only while any of its guest pages is trapped.
++    const uint64_t HostBase = Address & ~uint64_t {IosHostPageSize - 1};
++    if (!RWXIntervals.Intersect({HostBase, HostBase + IosHostPageSize})) {
++      return {false, 0};
++    }
++#else
+     if (!RWXIntervals.Query(Address).Enclosed) {
+       return {false, 0};
+     }
++#endif
+     return {true, GetUntrapProt(Address)};
+   }(FaultAddress);
+ 
+@@ -523,6 +535,14 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+     {
+       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+ 
++#ifdef FEX_IOS_HOST
++      /* ml1307: the host page is 16 KB and Wine protects it with the UNION of its
++       * four guest pages (ProtectRWXIntervalsInternal traps whole host pages for the
++       * same reason). Untrap the whole host page too: invalidate all four, then make
++       * them writable, or the host page stays read-only and the store re-faults. */
++      (void)UntrapProt;
++      ProtectRWXIntervalsInternal(FaultAddress & ~uint64_t {IosHostPageSize - 1}, IosHostPageSize, true);
++#else
+       InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+ 
+       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
+@@ -530,6 +550,7 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
+       SIZE_T TmpSize = 1;
+       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
++#endif
+     }
+     DetectMonoBackpatcherBlock(Thread, HostPc);
+     return true;
+@@ -832,6 +853,18 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
+ }
+ 
+ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
++#ifdef FEX_IOS_HOST
++  /* ml1307: trap and untrap whole 16 KB host pages. Wine gives a host page the UNION
++   * of its four guest pages' protections, so trapping only the 4 KB page that holds
++   * the code left the host page writable whenever a neighbour was: CoreCLR keeps
++   * precodes and data side by side, its code writes never faulted, and translations
++   * of patched precodes went stale (ThePreStub loop). */
++  {
++    const uint64_t HostEnd = (Address + Size + IosHostPageSize - 1) & ~uint64_t {IosHostPageSize - 1};
++    Address &= ~uint64_t {IosHostPageSize - 1};
++    Size = HostEnd - Address;
++  }
++#endif
+   const auto End = Address + Size;
+   std::shared_lock Lock(IntervalsLock);
+ 
