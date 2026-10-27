@@ -745,6 +745,12 @@ final class LibraryModel: ObservableObject {
     var blocksGameplayTouch: Bool { preparing != nil || (current != nil && (menu || launching)) }
     private var timer: Timer?
     private var sawProcess = false
+    /// Quit was asked and the session is still running after `forceCloseDelay`:
+    /// a program can hang inside its own exit (seen with one stuck on a Steam
+    /// client thread), and Alt+F4 cannot reach it any more. The HUD then offers
+    /// to close Madeira, which a second session needs anyway.
+    @Published var forceCloseOffered = false
+    private static let forceCloseDelay: TimeInterval = 10
     // Why a session ended by itself (not Quit): the program the app launched
     // exited with a Windows error (wine_crash_exit_status, WineProcessBridge.m).
     // MADEIRA_EXIT_REPORT=0 returns to the library without a message.
@@ -1206,7 +1212,7 @@ final class LibraryModel: ObservableObject {
     /// `dock`: the game a Madeira Dock start launches (DockStartScreen).
     func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil) {
         wine_exit_status_reset()
-        quitRequested = false
+        quitRequested = false; forceCloseOffered = false
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
         Self.sessionsThisRun += 1
         launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false; launchLogs = entry.liveLogs
@@ -1352,6 +1358,20 @@ final class LibraryModel: ObservableObject {
         sessionMessage = "Close requested. Confirm any in-game exit dialog."
         menu = false
         fputs("[frontend] graceful close requested\n", stderr)
+        let session = current
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.forceCloseDelay) { [weak self] in
+            guard let self, self.quitRequested, self.current != nil, self.current == session,
+                  !self.forceCloseOffered else { return }
+            self.forceCloseOffered = true
+            self.sessionMessage = "The game has not closed."
+            LogStore.shared.log("[frontend] still running \(Int(Self.forceCloseDelay))s after quit: force close offered")
+        }
+    }
+    /// The HUD's Force close: ends the whole process, as Restart Madeira does.
+    func forceClose() {
+        saveCurrentProfile()
+        LogStore.shared.log("[frontend] force closed by the user after quit")
+        exit(0)
     }
     func saveCurrentProfile() {
         let controls = TouchControlsModel.shared
@@ -1384,7 +1404,7 @@ final class LibraryModel: ObservableObject {
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
         GestureZonesModel.shared.selected = nil; GestureZonesModel.shared.zones = savedZones
         if ControlPresetsModel.enabled { controls.layoutID = savedLayout }
-        current = nil; activeEntry = nil; menu = false; sessionMessage = ""
+        current = nil; activeEntry = nil; menu = false; sessionMessage = ""; forceCloseOffered = false
         displayMode = .fit
         LogStore.shared.setDisplayActive(true)
         launching = false; launchLogs = false; LibraryKeyboard.hide()
@@ -4470,6 +4490,7 @@ struct LibraryHUD: View {
     @ObservedObject private var curtain = LaunchCurtain.shared
     /// The Session menu's Controller binds page (keyboard-and-mouse mode).
     @State private var bindsPage = false
+    @State private var confirmForceClose = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         GeometryReader { geo in
@@ -4493,6 +4514,12 @@ struct LibraryHUD: View {
                 if !model.startingScreen && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs && !model.startingScreen { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
                 if !model.sessionMessage.isEmpty && !model.startingScreen { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
+                if model.forceCloseOffered && !model.startingScreen && !model.menu {
+                    Button(role: .destructive) { confirmForceClose = true } label: {
+                        Label("Force close Madeira", systemImage: "xmark.octagon").font(.callout.weight(.semibold))
+                    }.buttonStyle(.borderedProminent).tint(.red)
+                        .frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 56)
+                }
                 if !model.startingScreen { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
@@ -4531,6 +4558,12 @@ struct LibraryHUD: View {
             .preferredColorScheme(.dark)
         }.ignoresSafeArea()
         .onAppear { model.saveCurrentProfile() }
+        .alert("Force close Madeira?", isPresented: $confirmForceClose) {
+            Button("Force close", role: .destructive) { model.forceClose() }
+            Button("Wait", role: .cancel) {}
+        } message: {
+            Text("The game did not close after Quit. Madeira closes completely; progress the game had not saved is lost.")
+        }
         .onChange(of: model.menu) { _, open in
             LibraryController.shared.configure(enabled: model.enabled, ownsInput: open)
             if !open { bindsPage = false }
@@ -4880,6 +4913,12 @@ struct LibraryHUD: View {
                     Label("Quit game", systemImage: "stop.circle").foregroundStyle(.red)
                 }.tint(.red)
                 Text("Closes the running session. Unsaved progress will be lost.").font(.caption).foregroundStyle(.secondary)
+                if model.forceCloseOffered {
+                    Button(role: .destructive) { confirmForceClose = true } label: {
+                        Label("Force close Madeira", systemImage: "xmark.octagon").foregroundStyle(.red)
+                    }.tint(.red)
+                    Text("The game did not close after Quit. This ends Madeira itself; open it again to play.").font(.caption).foregroundStyle(.secondary)
+                }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(22)
                 .foregroundStyle(.primary)
         }

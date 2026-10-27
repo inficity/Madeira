@@ -265,6 +265,10 @@ in-game menu:
    `MADEIRA_SESSION_DIAGNOSTICS=1`);
 4. **Quit game** in red. Quit asks the program to close with Alt+F4 through
    the normal input queue, so it can save; the session ends when it exits.
+   A program can hang inside its own exit, where Alt+F4 no longer reaches it.
+   If the session is still running 10 seconds after Quit, the HUD and the menu
+   offer **Force close Madeira** (after a confirmation), which ends the app
+   process as **Restart Madeira** does.
 
 Changes made in the menu (FPS limit, Aspect & scaling, controls, overlay) are
 saved to the game's profile.
